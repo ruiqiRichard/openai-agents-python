@@ -532,7 +532,8 @@ class Converter:
                 )
                 tool_calls.append(new_tool_call)
                 asst["tool_calls"] = tool_calls
-                asst['reasoning_content'] = pending_thinking_content
+                if pending_thinking_content:
+                    asst['reasoning_content'] = pending_thinking_content
             # 5) function call output => tool message
             elif func_output := cls.maybe_function_tool_call_output(item):
                 flush_assistant_message()
