@@ -368,6 +368,7 @@ class Converter:
         result: list[ChatCompletionMessageParam] = []
         current_assistant_msg: ChatCompletionAssistantMessageParam | None = None
         pending_thinking_blocks: list[dict[str, str]] | None = None
+        pending_thinking_content = ""
 
         def flush_assistant_message() -> None:
             nonlocal current_assistant_msg
@@ -531,6 +532,8 @@ class Converter:
                 )
                 tool_calls.append(new_tool_call)
                 asst["tool_calls"] = tool_calls
+                if pending_thinking_content:
+                    asst['reasoning_content'] = pending_thinking_content
             # 5) function call output => tool message
             elif func_output := cls.maybe_function_tool_call_output(item):
                 flush_assistant_message()
@@ -553,6 +556,7 @@ class Converter:
             # 7) reasoning message => extract thinking blocks if present
             elif reasoning_item := cls.maybe_reasoning_message(item):
                 # Reconstruct thinking blocks from content (text) and encrypted_content (signature)
+                pending_thinking_content = reasoning_item.get("summary", [])[0].get("text", "")
                 content_items = reasoning_item.get("content", [])
                 encrypted_content = reasoning_item.get("encrypted_content")
                 signatures = encrypted_content.split("\n") if encrypted_content else []
