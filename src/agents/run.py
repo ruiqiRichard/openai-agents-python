@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, cast, get_args
+from typing import Any, Callable, Generic, cast, get_args, get_origin
 
 from openai.types.responses import (
     ResponseCompletedEvent,
@@ -44,7 +46,7 @@ from .guardrail import (
     OutputGuardrail,
     OutputGuardrailResult,
 )
-from .handoffs import Handoff, HandoffInputFilter, handoff
+from .handoffs import Handoff, HandoffHistoryMapper, HandoffInputFilter, handoff
 from .items import (
     HandoffCallItem,
     ItemHelpers,
@@ -194,6 +196,19 @@ class RunConfig:
     """A global input filter to apply to all handoffs. If `Handoff.input_filter` is set, then that
     will take precedence. The input filter allows you to edit the inputs that are sent to the new
     agent. See the documentation in `Handoff.input_filter` for more details.
+    """
+
+    nest_handoff_history: bool = True
+    """Wrap prior run history in a single assistant message before handing off when no custom
+    input filter is set. Set to False to preserve the raw transcript behavior from previous
+    releases.
+    """
+
+    handoff_history_mapper: HandoffHistoryMapper | None = None
+    """Optional function that receives the normalized transcript (history + handoff items) and
+    returns the input history that should be passed to the next agent. When left as `None`, the
+    runner collapses the transcript into a single assistant message. This function only runs when
+    `nest_handoff_history` is True.
     """
 
     input_guardrails: list[InputGuardrail[Any]] | None = None
@@ -599,11 +614,31 @@ class AgentRunner:
                     )
 
                     if current_turn == 1:
+                        # Separate guardrails based on execution mode.
+                        all_input_guardrails = starting_agent.input_guardrails + (
+                            run_config.input_guardrails or []
+                        )
+                        sequential_guardrails = [
+                            g for g in all_input_guardrails if not g.run_in_parallel
+                        ]
+                        parallel_guardrails = [g for g in all_input_guardrails if g.run_in_parallel]
+
+                        # Run blocking guardrails first, before agent starts.
+                        # (will raise exception if tripwire triggered).
+                        sequential_results = []
+                        if sequential_guardrails:
+                            sequential_results = await self._run_input_guardrails(
+                                starting_agent,
+                                sequential_guardrails,
+                                _copy_str_or_list(prepared_input),
+                                context_wrapper,
+                            )
+
+                        # Run parallel guardrails + agent together.
                         input_guardrail_results, turn_result = await asyncio.gather(
                             self._run_input_guardrails(
                                 starting_agent,
-                                starting_agent.input_guardrails
-                                + (run_config.input_guardrails or []),
+                                parallel_guardrails,
                                 _copy_str_or_list(prepared_input),
                                 context_wrapper,
                             ),
@@ -620,6 +655,9 @@ class AgentRunner:
                                 server_conversation_tracker=server_conversation_tracker,
                             ),
                         )
+
+                        # Combine sequential and parallel results.
+                        input_guardrail_results = sequential_results + input_guardrail_results
                     else:
                         turn_result = await self._run_single_turn(
                             agent=current_agent,
@@ -646,51 +684,60 @@ class AgentRunner:
                     tool_input_guardrail_results.extend(turn_result.tool_input_guardrail_results)
                     tool_output_guardrail_results.extend(turn_result.tool_output_guardrail_results)
 
-                    if isinstance(turn_result.next_step, NextStepFinalOutput):
-                        output_guardrail_results = await self._run_output_guardrails(
-                            current_agent.output_guardrails + (run_config.output_guardrails or []),
-                            current_agent,
-                            turn_result.next_step.output,
-                            context_wrapper,
-                        )
-                        result = RunResult(
-                            input=original_input,
-                            new_items=generated_items,
-                            raw_responses=model_responses,
-                            final_output=turn_result.next_step.output,
-                            _last_agent=current_agent,
-                            input_guardrail_results=input_guardrail_results,
-                            output_guardrail_results=output_guardrail_results,
-                            tool_input_guardrail_results=tool_input_guardrail_results,
-                            tool_output_guardrail_results=tool_output_guardrail_results,
-                            context_wrapper=context_wrapper,
-                        )
-                        if not any(
-                            guardrail_result.output.tripwire_triggered
-                            for guardrail_result in input_guardrail_results
-                        ):
-                            await self._save_result_to_session(
-                                session, [], turn_result.new_step_items
+                    try:
+                        if isinstance(turn_result.next_step, NextStepFinalOutput):
+                            output_guardrail_results = await self._run_output_guardrails(
+                                current_agent.output_guardrails
+                                + (run_config.output_guardrails or []),
+                                current_agent,
+                                turn_result.next_step.output,
+                                context_wrapper,
                             )
+                            result = RunResult(
+                                input=original_input,
+                                new_items=generated_items,
+                                raw_responses=model_responses,
+                                final_output=turn_result.next_step.output,
+                                _last_agent=current_agent,
+                                input_guardrail_results=input_guardrail_results,
+                                output_guardrail_results=output_guardrail_results,
+                                tool_input_guardrail_results=tool_input_guardrail_results,
+                                tool_output_guardrail_results=tool_output_guardrail_results,
+                                context_wrapper=context_wrapper,
+                            )
+                            if not any(
+                                guardrail_result.output.tripwire_triggered
+                                for guardrail_result in input_guardrail_results
+                            ):
+                                await self._save_result_to_session(
+                                    session, [], turn_result.new_step_items
+                                )
 
-                        return result
-                    elif isinstance(turn_result.next_step, NextStepHandoff):
-                        current_agent = cast(Agent[TContext], turn_result.next_step.new_agent)
-                        current_span.finish(reset_current=True)
-                        current_span = None
-                        should_run_agent_start_hooks = True
-                    elif isinstance(turn_result.next_step, NextStepRunAgain):
-                        if not any(
-                            guardrail_result.output.tripwire_triggered
-                            for guardrail_result in input_guardrail_results
-                        ):
-                            await self._save_result_to_session(
-                                session, [], turn_result.new_step_items
+                            return result
+                        elif isinstance(turn_result.next_step, NextStepHandoff):
+                            current_agent = cast(Agent[TContext], turn_result.next_step.new_agent)
+                            current_span.finish(reset_current=True)
+                            current_span = None
+                            should_run_agent_start_hooks = True
+                        elif isinstance(turn_result.next_step, NextStepRunAgain):
+                            if not any(
+                                guardrail_result.output.tripwire_triggered
+                                for guardrail_result in input_guardrail_results
+                            ):
+                                await self._save_result_to_session(
+                                    session, [], turn_result.new_step_items
+                                )
+                        else:
+                            raise AgentsException(
+                                f"Unknown next step type: {type(turn_result.next_step)}"
                             )
-                    else:
-                        raise AgentsException(
-                            f"Unknown next step type: {type(turn_result.next_step)}"
-                        )
+                    finally:
+                        # RunImpl.execute_tools_and_side_effects returns a SingleStepResult that
+                        # stores direct references to the `pre_step_items` and `new_step_items`
+                        # lists it manages internally. Clear them here so the next turn does not
+                        # hold on to items from previous turns and to avoid leaking agent refs.
+                        turn_result.pre_step_items.clear()
+                        turn_result.new_step_items.clear()
             except AgentsException as exc:
                 exc.run_data = RunErrorDetails(
                     input=original_input,
@@ -720,7 +767,40 @@ class AgentRunner:
         conversation_id = kwargs.get("conversation_id")
         session = kwargs.get("session")
 
-        return asyncio.get_event_loop().run_until_complete(
+        # Python 3.14 stopped implicitly wiring up a default event loop
+        # when synchronous code touches asyncio APIs for the first time.
+        # Several of our synchronous entry points (for example the Redis/SQLAlchemy session helpers)
+        # construct asyncio primitives like asyncio.Lock during __init__,
+        # which binds them to whatever loop happens to be the thread's default at that moment.
+        # To keep those locks usable we must ensure that run_sync reuses that same default loop
+        # instead of hopping over to a brand-new asyncio.run() loop.
+        try:
+            already_running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            already_running_loop = None
+
+        if already_running_loop is not None:
+            # This method is only expected to run when no loop is already active.
+            # (Each thread has its own default loop; concurrent sync runs should happen on
+            # different threads. In a single thread use the async API to interleave work.)
+            raise RuntimeError(
+                "AgentRunner.run_sync() cannot be called when an event loop is already running."
+            )
+
+        policy = asyncio.get_event_loop_policy()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                default_loop = policy.get_event_loop()
+            except RuntimeError:
+                default_loop = policy.new_event_loop()
+                policy.set_event_loop(default_loop)
+
+        # We intentionally leave the default loop open even if we had to create one above. Session
+        # instances and other helpers stash loop-bound primitives between calls and expect to find
+        # the same default loop every time run_sync is invoked on this thread.
+        # Schedule the async run on the default loop so that we can manage cancellation explicitly.
+        task = default_loop.create_task(
             self.run(
                 starting_agent,
                 input,
@@ -733,6 +813,24 @@ class AgentRunner:
                 conversation_id=conversation_id,
             )
         )
+
+        try:
+            # Drive the coroutine to completion, harvesting the final RunResult.
+            return default_loop.run_until_complete(task)
+        except BaseException:
+            # If the sync caller aborts (KeyboardInterrupt, etc.), make sure the scheduled task
+            # does not linger on the shared loop by cancelling it and waiting for completion.
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    default_loop.run_until_complete(task)
+            raise
+        finally:
+            if not default_loop.is_closed():
+                # The loop stays open for subsequent runs, but we still need to flush any pending
+                # async generators so their cleanup code executes promptly.
+                with contextlib.suppress(RuntimeError):
+                    default_loop.run_until_complete(default_loop.shutdown_asyncgens())
 
     def run_streamed(
         self,
@@ -888,6 +986,11 @@ class AgentRunner:
             for done in asyncio.as_completed(guardrail_tasks):
                 result = await done
                 if result.output.tripwire_triggered:
+                    # Cancel all remaining guardrail tasks if a tripwire is triggered.
+                    for t in guardrail_tasks:
+                        t.cancel()
+                    # Wait for cancellations to propagate by awaiting the cancelled tasks.
+                    await asyncio.gather(*guardrail_tasks, return_exceptions=True)
                     _error_tracing.attach_error_to_span(
                         parent_span,
                         SpanError(
@@ -898,6 +1001,9 @@ class AgentRunner:
                             },
                         ),
                     )
+                    queue.put_nowait(result)
+                    guardrail_results.append(result)
+                    break
                 queue.put_nowait(result)
                 guardrail_results.append(result)
         except Exception:
@@ -905,7 +1011,9 @@ class AgentRunner:
                 t.cancel()
             raise
 
-        streamed_result.input_guardrail_results = guardrail_results
+        streamed_result.input_guardrail_results = (
+            streamed_result.input_guardrail_results + guardrail_results
+        )
 
     @classmethod
     async def _start_streaming(
@@ -997,11 +1105,36 @@ class AgentRunner:
                     break
 
                 if current_turn == 1:
-                    # Run the input guardrails in the background and put the results on the queue
+                    # Separate guardrails based on execution mode.
+                    all_input_guardrails = starting_agent.input_guardrails + (
+                        run_config.input_guardrails or []
+                    )
+                    sequential_guardrails = [
+                        g for g in all_input_guardrails if not g.run_in_parallel
+                    ]
+                    parallel_guardrails = [g for g in all_input_guardrails if g.run_in_parallel]
+
+                    # Run sequential guardrails first.
+                    if sequential_guardrails:
+                        await cls._run_input_guardrails_with_queue(
+                            starting_agent,
+                            sequential_guardrails,
+                            ItemHelpers.input_to_new_input_list(prepared_input),
+                            context_wrapper,
+                            streamed_result,
+                            current_span,
+                        )
+                        # Check if any blocking guardrail triggered and raise before starting agent.
+                        for result in streamed_result.input_guardrail_results:
+                            if result.output.tripwire_triggered:
+                                streamed_result._event_queue.put_nowait(QueueCompleteSentinel())
+                                raise InputGuardrailTripwireTriggered(result)
+
+                    # Run parallel guardrails in background.
                     streamed_result._input_guardrails_task = asyncio.create_task(
                         cls._run_input_guardrails_with_queue(
                             starting_agent,
-                            starting_agent.input_guardrails + (run_config.input_guardrails or []),
+                            parallel_guardrails,
                             ItemHelpers.input_to_new_input_list(prepared_input),
                             context_wrapper,
                             streamed_result,
@@ -1566,6 +1699,8 @@ class AgentRunner:
                 # Cancel all guardrail tasks if a tripwire is triggered.
                 for t in guardrail_tasks:
                     t.cancel()
+                # Wait for cancellations to propagate by awaiting the cancelled tasks.
+                await asyncio.gather(*guardrail_tasks, return_exceptions=True)
                 _error_tracing.attach_error_to_current_span(
                     SpanError(
                         message="Guardrail tripwire triggered",
@@ -1833,7 +1968,19 @@ class AgentRunner:
 
 
 DEFAULT_AGENT_RUNNER = AgentRunner()
-_TOOL_CALL_TYPES: tuple[type, ...] = get_args(ToolCallItemTypes)
+
+
+def _get_tool_call_types() -> tuple[type, ...]:
+    normalized_types: list[type] = []
+    for type_hint in get_args(ToolCallItemTypes):
+        origin = get_origin(type_hint)
+        candidate = origin or type_hint
+        if isinstance(candidate, type):
+            normalized_types.append(candidate)
+    return tuple(normalized_types)
+
+
+_TOOL_CALL_TYPES: tuple[type, ...] = _get_tool_call_types()
 
 
 def _copy_str_or_list(input: str | list[TResponseInputItem]) -> str | list[TResponseInputItem]:

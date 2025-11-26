@@ -198,6 +198,7 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         self._playback_tracker: RealtimePlaybackTracker | None = None
         self._created_session: OpenAISessionCreateRequest | None = None
         self._server_event_type_adapter = get_server_event_type_adapter()
+        self._call_id: str | None = None
 
     async def connect(self, options: RealtimeModelConfig) -> None:
         """Establish a connection to the model and keep it alive."""
@@ -208,7 +209,19 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
 
         self._playback_tracker = options.get("playback_tracker", None)
 
-        self.model = model_settings.get("model_name", self.model)
+        call_id = options.get("call_id")
+        model_name = model_settings.get("model_name")
+        if call_id and model_name:
+            error_message = (
+                "Cannot specify both `call_id` and `model_name` "
+                "when attaching to an existing realtime call."
+            )
+            raise UserError(error_message)
+
+        if model_name:
+            self.model = model_name
+
+        self._call_id = call_id
         api_key = await get_api_key(options.get("api_key"))
 
         if "tracing" in model_settings:
@@ -216,7 +229,10 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         else:
             self._tracing_config = "auto"
 
-        url = options.get("url", f"wss://api.openai.com/v1/realtime?model={self.model}")
+        if call_id:
+            url = options.get("url", f"wss://api.openai.com/v1/realtime?call_id={call_id}")
+        else:
+            url = options.get("url", f"wss://api.openai.com/v1/realtime?model={self.model}")
 
         headers: dict[str, str] = {}
         if options.get("headers") is not None:
@@ -629,8 +645,9 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                 )
                 if not automatic_response_cancellation_enabled:
                     await self._cancel_response()
-            # Avoid sending conversation.item.truncate here; when GA is set to
-            # interrupt on VAD start, the server will handle truncation.
+            # Avoid sending conversation.item.truncate here. When the session's
+            # turn_detection.interrupt_response is enabled (GA default), the server emits
+            # conversation.item.truncated after the VAD start and takes care of history updates.
         elif parsed.type == "response.created":
             self._ongoing_response = True
             await self._emit_event(RealtimeModelTurnStartedEvent())
@@ -818,10 +835,13 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         speed = model_settings.get("speed")
         modalities = model_settings.get("modalities", DEFAULT_MODEL_SETTINGS.get("modalities"))
 
-        input_audio_format = model_settings.get(
-            "input_audio_format",
-            DEFAULT_MODEL_SETTINGS.get("input_audio_format"),
-        )
+        if self._call_id:
+            input_audio_format = model_settings.get("input_audio_format")
+        else:
+            input_audio_format = model_settings.get(
+                "input_audio_format",
+                DEFAULT_MODEL_SETTINGS.get("input_audio_format"),
+            )
         input_audio_transcription = model_settings.get(
             "input_audio_transcription",
             DEFAULT_MODEL_SETTINGS.get("input_audio_transcription"),
@@ -830,10 +850,13 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             "turn_detection",
             DEFAULT_MODEL_SETTINGS.get("turn_detection"),
         )
-        output_audio_format = model_settings.get(
-            "output_audio_format",
-            DEFAULT_MODEL_SETTINGS.get("output_audio_format"),
-        )
+        if self._call_id:
+            output_audio_format = model_settings.get("output_audio_format")
+        else:
+            output_audio_format = model_settings.get(
+                "output_audio_format",
+                DEFAULT_MODEL_SETTINGS.get("output_audio_format"),
+            )
         input_audio_noise_reduction = model_settings.get(
             "input_audio_noise_reduction",
             DEFAULT_MODEL_SETTINGS.get("input_audio_noise_reduction"),
@@ -927,6 +950,18 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             )
 
         return converted_tools
+
+
+class OpenAIRealtimeSIPModel(OpenAIRealtimeWebSocketModel):
+    """Realtime model that attaches to SIP-originated calls using a call ID."""
+
+    async def connect(self, options: RealtimeModelConfig) -> None:
+        call_id = options.get("call_id")
+        if not call_id:
+            raise UserError("OpenAIRealtimeSIPModel requires `call_id` in the model configuration.")
+
+        sip_options = options.copy()
+        await super().connect(sip_options)
 
 
 class _ConversionHelper:

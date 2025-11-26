@@ -54,6 +54,18 @@ class TestConnectionLifecycle(TestOpenAIRealtimeWebSocketModel):
                 await model.connect(config)
 
     @pytest.mark.asyncio
+    async def test_connect_with_call_id_and_model_raises_error(self, model):
+        """Test that specifying both call_id and model raises UserError."""
+        config = {
+            "api_key": "test-api-key-123",
+            "call_id": "call-123",
+            "initial_model_settings": {"model_name": "gpt-4o-realtime-preview"},
+        }
+
+        with pytest.raises(UserError, match="Cannot specify both `call_id` and `model_name`"):
+            await model.connect(config)
+
+    @pytest.mark.asyncio
     async def test_connect_with_string_api_key(self, model, mock_websocket):
         """Test successful connection with string API key."""
         config = {
@@ -593,6 +605,29 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         cfg = model._get_session_config(settings)
         assert cfg.audio is not None and cfg.audio.output is not None
         assert cfg.audio.output.voice == "verse"
+
+    def test_session_config_defaults_audio_formats_when_not_call(self, model):
+        settings: dict[str, Any] = {}
+        cfg = model._get_session_config(settings)
+        assert cfg.audio is not None
+        assert cfg.audio.input is not None
+        assert cfg.audio.input.format is not None
+        assert cfg.audio.input.format.type == "audio/pcm"
+        assert cfg.audio.output is not None
+        assert cfg.audio.output.format is not None
+        assert cfg.audio.output.format.type == "audio/pcm"
+
+    def test_session_config_preserves_sip_audio_formats(self, model):
+        model._call_id = "call-123"
+        settings = {
+            "turn_detection": {"type": "semantic_vad", "interrupt_response": True},
+        }
+        cfg = model._get_session_config(settings)
+        assert cfg.audio is not None
+        assert cfg.audio.input is not None
+        assert cfg.audio.input.format is None
+        assert cfg.audio.output is not None
+        assert cfg.audio.output.format is None
 
     @pytest.mark.asyncio
     async def test_handle_error_event_success(self, model):
